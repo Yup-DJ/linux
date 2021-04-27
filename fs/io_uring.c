@@ -8886,6 +8886,8 @@ static void io_uring_cancel_sqpoll(struct io_ring_ctx *ctx)
 		io_sq_thread_unpark(sqd);
 		return;
 	}
+	if (!current->io_uring)
+		return;
 
 	atomic_inc(&tctx->in_idle);
 	do {
