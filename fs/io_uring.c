@@ -6783,19 +6783,22 @@ static int io_sq_thread(void *data)
 
 	io_run_task_work();
 
+	if (io_sq_thread_should_park(sqd))
+		io_sq_thread_parkme(sqd);
+
 	/*
 	 * Clear thread under lock so that concurrent parks work correctly
 	 */
-	complete_all(&sqd->completion);
+	complete(&sqd->completion);
 	mutex_lock(&sqd->lock);
 	sqd->thread = NULL;
 	list_for_each_entry(ctx, &sqd->ctx_list, sqd_list) {
 		ctx->sqo_exec = 1;
 		io_ring_set_wakeup_flag(ctx);
 	}
-	mutex_unlock(&sqd->lock);
 
 	complete(&sqd->exited);
+	mutex_unlock(&sqd->lock);
 	do_exit(0);
 }
 
@@ -7118,13 +7121,19 @@ static bool io_sq_thread_park(struct io_sq_data *sqd)
 
 static void io_sq_thread_stop(struct io_sq_data *sqd)
 {
-	if (!sqd->thread)
+	if (test_bit(IO_SQ_THREAD_SHOULD_STOP, &sqd->state))
 		return;
-
-	set_bit(IO_SQ_THREAD_SHOULD_STOP, &sqd->state);
-	WARN_ON_ONCE(test_bit(IO_SQ_THREAD_SHOULD_PARK, &sqd->state));
-	wake_up_process(sqd->thread);
-	wait_for_completion(&sqd->exited);
+	mutex_lock(&sqd->lock);
+	if (sqd->thread) {
+		set_bit(IO_SQ_THREAD_SHOULD_STOP, &sqd->state);
+		WARN_ON_ONCE(test_bit(IO_SQ_THREAD_SHOULD_PARK, &sqd->state));
+		wake_up_process(sqd->thread);
+		mutex_unlock(&sqd->lock);
+		wait_for_completion(&sqd->exited);
+		WARN_ON_ONCE(sqd->thread);
+	} else {
+		mutex_unlock(&sqd->lock);
+	}
 }
 
 static void io_put_sq_data(struct io_sq_data *sqd)
@@ -8513,9 +8522,10 @@ static int io_remove_personalities(int id, void *p, void *data)
 	return 0;
 }
 
-static void io_run_ctx_fallback(struct io_ring_ctx *ctx)
+static bool io_run_ctx_fallback(struct io_ring_ctx *ctx)
 {
 	struct callback_head *work, *head, *next;
+	bool executed = false;
 
 	do {
 		do {
@@ -8532,7 +8542,10 @@ static void io_run_ctx_fallback(struct io_ring_ctx *ctx)
 			work = next;
 			cond_resched();
 		} while (work);
+		executed = true;
 	} while (1);
+
+	return executed;
 }
 
 static void io_ring_exit_work(struct work_struct *work)
@@ -8672,6 +8685,7 @@ static void io_uring_try_cancel_requests(struct io_ring_ctx *ctx,
 		ret |= io_poll_remove_all(ctx, task, files);
 		ret |= io_kill_timeouts(ctx, task, files);
 		ret |= io_run_task_work();
+		ret |= io_run_ctx_fallback(ctx);
 		io_cqring_overflow_flush(ctx, true, task, files);
 		if (!ret)
 			break;
@@ -8870,6 +8884,13 @@ static void io_uring_cancel_sqpoll(struct io_ring_ctx *ctx)
 	if (!io_sq_thread_park(sqd))
 		return;
 	tctx = ctx->sq_data->thread->io_uring;
+	/* can happen on fork/alloc failure, just ignore that state */
+	if (!tctx) {
+		io_sq_thread_unpark(sqd);
+		return;
+	}
+	if (!current->io_uring)
+		return;
 
 	atomic_inc(&tctx->in_idle);
 	do {
